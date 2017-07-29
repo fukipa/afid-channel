@@ -1,0 +1,283 @@
+      program AFiD
+      use mpih
+      use param
+      use local_arrays, only: vx,vy,vz,temp,pr
+      use hdf5
+      use decomp_2d
+      use decomp_2d_fft
+      use stat_arrays, only: nstatsamples
+!$    use omp_lib
+      implicit none
+      integer :: errorcode, nthreads
+      real    :: instCFL,dmax
+      real    :: ti(2), tin(3), minwtdt
+      real :: ts
+      integer :: prow=0,pcol=0
+      integer :: lfactor,lfactor2
+      character(100) :: arg
+
+!*******************************************************
+!******* Read input file bou.in by all processes********
+!*******************************************************
+!
+      call ReadInputFile
+
+  if (command_argument_count().eq.2) then
+     call get_command_argument(1,arg)
+     read(arg,'(i10)') prow
+     call get_command_argument(2,arg)
+     read(arg,'(i10)') pcol
+  endif
+
+  call decomp_2d_init(nxm,nym,nzm,prow,pcol,(/ .false.,.true.,.true./))
+
+  ts=MPI_WTIME()
+  tin(1) = MPI_WTIME()
+  call MpiBarrier
+  call HdfStart
+  if (nrank.eq.master) ismaster = .true.
+  if (ismaster) write(6,*) 'MPI tasks=', nproc
+
+!$    if (ismaster) then 
+!$OMP PARALLEL
+!$OMP MASTER
+!$        nthreads = omp_get_num_threads()
+!$OMP END MASTER
+!$OMP END PARALLEL
+!$        write(6,*) 'OMP threads=', nthreads
+!$    end if
+
+      if(ismaster) then
+!m==========================================    
+      call ResetLogs
+!m====================================================
+      write(6,112)ylen,zlen
+112 format(//,20x,'C H A N N E L ',//,10x,'3D Channel with dimensions:  Y/delta = ',f5.2,' Z/delta = ',f5.2)
+      write(6,142) 
+142 format(//,8x,'Periodic in y & z and wall boundary condition in x')
+      write(6,202) ReTau,pra
+202 format(/,5x,'Parameters: ',' Re_tau=',e10.3,' Pr= ',e10.3)
+      if(variabletstep) then
+        write(6,204) limitCFL
+204 format(/,5x,'Variable dt and fixed cfl= ', e11.4,/ )            
+      else 
+         write(6,205) dtmax,limitCFL
+205 format(/,5x,'Fixed dt= ',e11.4,' and maximum cfl=', e11.4,/ )            
+      endif
+      endif
+
+      call InitTimeMarchScheme
+
+      call InitVariables
+
+      call CreateGrid
+
+      call WriteGridInfo
+
+      if (dumpslabs) call InitializeSlabDump
+
+!m===================================                                                      
+!m===================================
+!m===================================
+      if(ismaster) then
+      write(6,754)nx,ny,nz                                              
+754 format(/,5x,'grid resolution: ',' nx= ',i5,' ny= ',i5, ' nz= ',i5/)                       
+      write(6,755) 1.d0/dx,1.d0/dy,1.d0/dz,dt,ntst                  
+755 format(/,2x,' dx=',e10.3,' dy=',e10.3,' dz=',e10.3,' dt=' ,e10.3,' ntst=',i7,/)
+      endif
+
+!m===================================
+!m===================================     
+      
+      time=0.d0
+      if(statcal) nstatsamples = 0
+
+      call InitPressureSolver
+      call SetTempBCs
+
+      if(readflow) then
+
+        if(ismaster) write(6,*) 'Reading initial condition from file'
+
+        call ReadFlowField
+
+      else
+
+        if(ismaster) write(6,*) 'Generating initial conditions'
+        ntime=0                                                         
+        time=0.d0
+        instCFL=0.d0
+        call CreateInitialConditions
+        endif                                                             
+
+!EP   Update all relevant halos
+      call update_halo(vx,lvlhalo)
+      call update_halo(vy,lvlhalo)
+      call update_halo(vz,lvlhalo)
+      call update_halo(temp,lvlhalo)
+      call update_halo(pr,lvlhalo)
+
+!EP   Check divergence. Should be reduced to machine precision after the first
+!phcalc. Here it can still be high.
+
+      call CheckDivergence(dmax)
+
+!     if(ismaster) write(6,1765)dmax
+768 FORMAT(3X,'NTIME='  ,1X,I7,1X,      &
+              'TIME='    ,1X,F12.7,1X,     &
+              'DT='      ,1X,F8.5,1X,       &
+              'DIVMAX='  ,1X,F7.3,1X,   &
+              'TEMPMEAN=',1X,F7.3,1X, &
+              'TEMPMAX=' ,1X,F7.3,1X,  &
+              'TEMPMIN=' ,1X,F7.3,1X )
+
+!EP   Write some values
+      if(variabletstep) then
+       if(ismaster) write(6,768)ntime,time,dt,dmax,tempm,tempmax,tempmin
+      else
+       if(ismaster) write(6,768)ntime,time,dt,dmax,tempm,tempmax,tempmin !RO Fix??
+      end if
+
+      if(ismaster) then                  
+        tin(2) = MPI_WTIME()             
+       write(6,1765) DMAX, tin(2)-tin(1)
+1765  FORMAT(3X,'INITDIVMAX=',1X,F6.2,1X,'INITTIME=',1X,F6.2,1X,'SEC.')
+      endif 
+                                                                        
+!  ********* starts the time dependent calculation ***
+      errorcode = 0 !EP set errocode to 0 (OK)
+      minwtdt = huge(0.0d0) !EP initialize minimum time step walltime
+
+      ! Check input for efficient FFT
+      ! factorize input FFT directions. The largest factor should
+      ! be relatively small to have efficient FFT's
+      lfactor=2 ! initialize
+      call Factorize(nym,lfactor2) ! check nym
+      lfactor=max(lfactor,lfactor2)
+      call Factorize(nzm,lfactor2)
+      lfactor=max(lfactor,lfactor2)
+      ! if largest factor larger than 7 quit the simulation     
+      if (lfactor>7) errorcode=444
+
+      do ntime=0,ntst                                           
+        ti(1) = MPI_WTIME()
+
+!EP   Determine timestep size
+        call CalcMaxCFL(instCFL)
+
+        if(variabletstep) then
+          if(ntime.gt.1) then
+            if(instCFL.lt.1.0d-8) then !EP prevent fp-overflow
+              dt=dtmax
+            else
+              dt=limitCFL/instCFL
+            endif
+            if(dt.gt.dtmax) dt=dtmax
+          else
+            dt=dtmin
+          endif
+            if(dt.lt.dtmin) errorcode = 166
+        else  
+!RO    fixed time-step
+          instCFL=instCFL*dt
+          if(instCFL.gt.limitCFL) errorcode = 165
+        endif
+
+        call TimeMarcher
+
+!        if(mod(time,tout).lt.dt) then
+!         if(ismaster) then
+!          !write(6,*) ' ---------------------------------------- '
+!          write(6,768) time,ntime,dt
+!         endif
+!        endif
+
+!768  FORMAT(3X,2HT=,1X,F12.7,1X,6HNTIME=,1X,F12.7,1X,3HDT=,1X,F12.7)
+        time=time+dt
+
+        if(ntime.eq.1.or.mod(time,tout).lt.dt) then
+          call GlobalQuantities
+          if(vmax(1).gt.limitVel.and.vmax(2).gt.limitVel) errorcode = 266
+
+            call CalcMaxCFL(instCFL)
+            call CheckDivergence(dmax)
+            call CalcPlateNu
+
+            if(time.gt.tsta) then
+
+             if (statcal)  call CalcStats
+             if (dumpslabs) call SlabDumper
+             if (disscal.and.statcal) call CalcDissipationNu
+
+            endif
+
+            if(.not.variabletstep) instCFL=instCFL*dt
+
+            if(abs(dmax).gt.resid) errorcode = 169
+
+        endif
+
+        if(time.gt.tmax) errorcode = 333
+
+769  FORMAT(3X,'NTIME='  ,1X,I7,1X,      &
+              'TIME='    ,1X,F12.7,1X,     &
+              'DT='      ,1X,F8.5,1X,       &
+              'VMAX1='   ,1X,F7.3,1X,    &
+              'VMAX2='   ,1X,F7.3,1X,    &
+              'VMAX3='   ,1X,F7.3,1X,    &
+              'TEMPMEAN=',1X,F7.3,1X, &
+              'TEMPMAX=' ,1X,F7.3,1X,  &
+              'TEMPMIN=' ,1X,F7.3,1X,  &
+              'DIVMAX='  ,1X,F7.3,1X,   &
+              'MINWTDT=' ,1X,F10.4,1X,  &
+              'SEC.',1X )
+        ti(2) = MPI_WTIME()
+        minwtdt = min(minwtdt,ti(2) - ti(1))
+        if(mod(time,tout).lt.dt) then
+          if(ismaster) then
+    write(6,769)ntime,time,dt,vmax(1),vmax(2),vmax(3),tempm,tempmax,tempmin,dmax,minwtdt
+          endif
+          minwtdt = huge(0.0d0)
+        endif
+
+       if( (ti(2) - tin(1)) .gt. walltimemax) errorcode = 334
+
+      call MpiBcastInt(errorcode)
+
+!EP   Conditional exits
+      if(errorcode.ne.0) then
+
+!EP    dt too small
+        if(errorcode.eq.166) call QuitRoutine(tin,.false.,errorcode)
+
+!EP   cfl too high    
+        if(errorcode.eq.165) call QuitRoutine(tin,.false.,errorcode)
+      
+!EP   velocities diverged
+        if(errorcode.eq.266) call QuitRoutine(tin,.false.,errorcode)
+          
+!EP   mass not conserved
+        if(errorcode.eq.169) call QuitRoutine(tin,.false.,errorcode)
+
+!EP   Physical time exceeded tmax, no error; normal quit
+        if(errorcode.eq.333) call QuitRoutine(tin,.true.,errorcode)
+
+!EP   walltime exceeded walltimemax, no error; normal quit
+        if(errorcode.eq.334) call QuitRoutine(tin,.true.,errorcode)
+
+!RS   FFT input not correct
+        if(errorcode.eq.444) call QuitRoutine(tin,.true.,errorcode)
+
+
+        errorcode = 100 !EP already finalized
+      
+        exit
+
+      endif
+
+      enddo !EP main loop
+
+      call QuitRoutine(tin,.true.,errorcode)
+      
+      end                                                               
+
